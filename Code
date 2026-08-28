@@ -1,0 +1,2078 @@
+"""
+Module 01 – Intent2Device
+Requirement Interpreter: converts natural-language device descriptions
+into structured engineering requirements.
+"""
+
+from __future__ import annotations
+import re
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class DeviceRequirements:
+    device_type: str = ""
+    power_class: str = ""          # low / medium / high
+    drive_current: str = ""        # high / medium / low
+    leakage_target: str = ""       # low / ultra-low / standard
+    breakdown_voltage: Optional[float] = None  # V
+    threshold_voltage: Optional[float] = None  # V
+    channel_type: str = ""         # N / P
+    application: str = ""
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "device_type": self.device_type,
+            "channel_type": self.channel_type,
+            "power_class": self.power_class,
+            "drive_current": self.drive_current,
+            "leakage_target": self.leakage_target,
+            "breakdown_voltage_V": self.breakdown_voltage,
+            "threshold_voltage_V": self.threshold_voltage,
+            "application": self.application,
+            "notes": self.notes,
+        }
+
+
+class Intent2Device:
+    """
+    Parses a free-form engineer description and returns a
+    DeviceRequirements object with extracted engineering parameters.
+    """
+
+    # --- keyword maps -------------------------------------------------------
+    _DEVICE_KEYWORDS = {
+        "nmos": ("MOSFET", "N"),
+        "nfet": ("MOSFET", "N"),
+        "pmos": ("MOSFET", "P"),
+        "pfet": ("MOSFET", "P"),
+        "finfet": ("FinFET", "N"),
+        "p-finfet": ("FinFET", "P"),
+        "n-finfet": ("FinFET", "N"),
+        "bjt": ("BJT", "N"),
+        "igbt": ("IGBT", "N"),
+        "jfet": ("JFET", "N"),
+    }
+
+    _POWER_KEYWORDS = {
+        "low-power": "low", "low power": "low",
+        "ultra-low power": "ultra-low",
+        "high-power": "high", "high power": "high",
+        "medium power": "medium",
+    }
+
+    _LEAKAGE_KEYWORDS = {
+        "low leakage": "low", "low-leakage": "low",
+        "ultra-low leakage": "ultra-low",
+        "minimal leakage": "low",
+    }
+
+    _DRIVE_KEYWORDS = {
+        "high drive current": "high", "high current": "high",
+        "large drive": "high",
+        "low drive": "low", "low current": "low",
+    }
+
+    def parse(self, description: str) -> DeviceRequirements:
+        req = DeviceRequirements()
+        text = description.lower()
+
+        # Device type + channel
+        for keyword, (dev, ch) in self._DEVICE_KEYWORDS.items():
+            if keyword in text:
+                req.device_type = dev
+                req.channel_type = ch
+                break
+
+        # Power class
+        for kw, val in self._POWER_KEYWORDS.items():
+            if kw in text:
+                req.power_class = val
+                break
+
+        # Leakage
+        for kw, val in self._LEAKAGE_KEYWORDS.items():
+            if kw in text:
+                req.leakage_target = val
+                break
+
+        # Drive current
+        for kw, val in self._DRIVE_KEYWORDS.items():
+            if kw in text:
+                req.drive_current = val
+                break
+
+        # Numeric voltage extraction  e.g. "5V breakdown", "Vth = 0.4V"
+        bv_match = re.search(r'(\d+(?:\.\d+)?)\s*v\s*breakdown', text)
+        if bv_match:
+            req.breakdown_voltage = float(bv_match.group(1))
+
+        vth_match = re.search(r'v[_\s]?t[hn]\s*[=~]\s*(\d+(?:\.\d+)?)\s*v', text)
+        if vth_match:
+            req.threshold_voltage = float(vth_match.group(1))
+
+        # Application hints
+        if any(w in text for w in ["iot", "sensor", "wearable", "implant"]):
+            req.application = "IoT/low-power"
+        elif any(w in text for w in ["rf", "amplifier", "wireless"]):
+            req.application = "RF/analog"
+        elif any(w in text for w in ["power supply", "motor", "converter"]):
+            req.application = "power electronics"
+        elif any(w in text for w in ["logic", "cpu", "memory", "soc"]):
+            req.application = "digital logic"
+
+        req.notes.append(f"Source description: \"{description}\"")
+        return req
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    engine = Intent2Device()
+    desc = "I need a low-power NMOS with high drive current and low leakage."
+    reqs = engine.parse(desc)
+    import json
+    print(json.dumps(reqs.to_dict(), indent=2))
+
+
+
+"""
+Module 02 – Device Architect
+AI Design Assistant: proposes an initial device design (architecture,
+materials, dimensions, oxide thickness, doping, bias, initial parameters)
+from a DeviceRequirements object.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Optional
+
+from .intent2device import DeviceRequirements
+
+
+@dataclass
+class DeviceDesign:
+    architecture: str = ""          # e.g. "Planar MOSFET", "FinFET"
+    channel_type: str = ""          # N / P
+    material: str = ""              # e.g. "Si", "SiGe"
+    channel_length_nm: float = 0.0
+    channel_width_nm: float = 0.0
+    oxide_thickness_nm: float = 0.0
+    oxide_material: str = "SiO2"
+    doping_channel_cm3: float = 0.0
+    doping_source_drain_cm3: float = 0.0
+    supply_voltage_V: float = 0.0
+    vgs_bias_V: float = 0.0
+    vds_bias_V: float = 0.0
+    vth_target_V: float = 0.0
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+
+class DeviceArchitect:
+    """
+    Rule-based design proposer.  Uses a lookup table of device families
+    and scales parameters to the requested performance class.
+    """
+
+    # Base design templates keyed by (device_type, channel_type)
+    _TEMPLATES: dict[tuple[str, str], dict] = {
+        ("MOSFET", "N"): dict(
+            architecture="Planar NMOSFET",
+            material="Si",
+            channel_length_nm=180.0,
+            channel_width_nm=1000.0,
+            oxide_thickness_nm=3.5,
+            oxide_material="SiO2",
+            doping_channel_cm3=1e17,
+            doping_source_drain_cm3=1e20,
+            supply_voltage_V=1.8,
+            vgs_bias_V=1.8,
+            vds_bias_V=1.8,
+            vth_target_V=0.5,
+        ),
+        ("MOSFET", "P"): dict(
+            architecture="Planar PMOSFET",
+            material="Si",
+            channel_length_nm=180.0,
+            channel_width_nm=1000.0,
+            oxide_thickness_nm=3.5,
+            oxide_material="SiO2",
+            doping_channel_cm3=1e17,
+            doping_source_drain_cm3=1e20,
+            supply_voltage_V=1.8,
+            vgs_bias_V=-1.8,
+            vds_bias_V=-1.8,
+            vth_target_V=-0.5,
+        ),
+        ("FinFET", "N"): dict(
+            architecture="N-type FinFET",
+            material="Si",
+            channel_length_nm=14.0,
+            channel_width_nm=7.0,
+            oxide_thickness_nm=1.0,
+            oxide_material="HfO2",
+            doping_channel_cm3=5e16,
+            doping_source_drain_cm3=1e20,
+            supply_voltage_V=0.8,
+            vgs_bias_V=0.8,
+            vds_bias_V=0.8,
+            vth_target_V=0.3,
+        ),
+        ("FinFET", "P"): dict(
+            architecture="P-type FinFET",
+            material="SiGe",
+            channel_length_nm=14.0,
+            channel_width_nm=7.0,
+            oxide_thickness_nm=1.0,
+            oxide_material="HfO2",
+            doping_channel_cm3=5e16,
+            doping_source_drain_cm3=1e20,
+            supply_voltage_V=0.8,
+            vgs_bias_V=-0.8,
+            vds_bias_V=-0.8,
+            vth_target_V=-0.3,
+        ),
+    }
+
+    _DEFAULT_TEMPLATE = ("MOSFET", "N")
+
+    def propose(self, req: DeviceRequirements) -> DeviceDesign:
+        key = (req.device_type, req.channel_type)
+        template = self._TEMPLATES.get(key, self._TEMPLATES[self._DEFAULT_TEMPLATE])
+        design = DeviceDesign(**template)
+        design.channel_type = req.channel_type or design.channel_type
+
+        # --- scale for power class ------------------------------------------
+        if req.power_class in ("low", "ultra-low"):
+            design.supply_voltage_V *= 0.6
+            design.vgs_bias_V = design.supply_voltage_V * (
+                1 if req.channel_type != "P" else -1
+            )
+            design.vds_bias_V = design.vgs_bias_V
+            design.oxide_thickness_nm = max(1.0, design.oxide_thickness_nm * 0.8)
+            design.channel_length_nm = max(10.0, design.channel_length_nm * 0.7)
+            design.notes.append("Scaled for low-power operation.")
+
+        if req.power_class == "high":
+            design.supply_voltage_V *= 1.5
+            design.channel_width_nm *= 4
+            design.doping_source_drain_cm3 *= 1.5
+            design.notes.append("Scaled for high-power / high-current operation.")
+
+        # --- leakage tuning -------------------------------------------------
+        if req.leakage_target in ("low", "ultra-low"):
+            design.vth_target_V = abs(design.vth_target_V) * 1.2
+            if req.channel_type == "P":
+                design.vth_target_V *= -1
+            design.doping_channel_cm3 *= 1.5
+            design.notes.append(
+                "Increased Vth and channel doping to suppress leakage."
+            )
+
+        # --- drive current tuning -------------------------------------------
+        if req.drive_current == "high":
+            design.channel_width_nm *= 2
+            design.channel_length_nm = max(10.0, design.channel_length_nm * 0.85)
+            design.notes.append("Widened channel and shortened length for high Ion.")
+
+        # --- override Vth if explicitly specified ---------------------------
+        if req.threshold_voltage is not None:
+            design.vth_target_V = req.threshold_voltage
+            design.notes.append(
+                f"Vth overridden by user specification: {req.threshold_voltage} V."
+            )
+
+        # --- breakdown voltage hint -----------------------------------------
+        if req.breakdown_voltage is not None:
+            design.notes.append(
+                f"Target breakdown voltage: {req.breakdown_voltage} V – "
+                "consider lightly-doped drain (LDD) extension or RESURF technique."
+            )
+
+        return design
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    from .intent2device import Intent2Device
+    import json
+
+    reqs = Intent2Device().parse(
+        "I need a low-power NMOS with high drive current and low leakage."
+    )
+    design = DeviceArchitect().propose(reqs)
+    print(json.dumps(design.to_dict(), indent=2, default=str))
+
+
+
+"""
+Module 04 – SmartSample
+Sample-to-Output Intelligence: generates expected I-V characteristics,
+Vth, Ion/Ioff, leakage, power, and performance curves from device
+parameters, learning the underlying physics relationships even with
+a sparse sample set.
+"""
+
+from __future__ import annotations
+import math
+from dataclasses import dataclass, field
+from typing import Optional
+
+from .device_architect import DeviceDesign
+
+
+@dataclass
+class SamplePoint:
+    vgs: float
+    vds: float
+    ids: float  # drain current (A/µm)
+
+
+@dataclass
+class DeviceCharacteristics:
+    vth_V: float = 0.0
+    ion_A_um: float = 0.0        # on-state current per micron
+    ioff_A_um: float = 0.0       # off-state leakage per micron
+    ion_ioff_ratio: float = 0.0
+    ss_mV_dec: float = 0.0       # subthreshold slope mV/dec
+    power_dynamic_uW: float = 0.0
+    power_static_uW: float = 0.0
+    iv_transfer: list[SamplePoint] = field(default_factory=list)  # VGS sweep @ fixed VDS
+    iv_output: list[SamplePoint] = field(default_factory=list)    # VDS sweep @ fixed VGS
+    predicted_trends: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "vth_V": round(self.vth_V, 4),
+            "ion_A_um": f"{self.ion_A_um:.3e}",
+            "ioff_A_um": f"{self.ioff_A_um:.3e}",
+            "ion_ioff_ratio": f"{self.ion_ioff_ratio:.2e}",
+            "ss_mV_dec": round(self.ss_mV_dec, 1),
+            "power_dynamic_uW": round(self.power_dynamic_uW, 4),
+            "power_static_uW": round(self.power_static_uW, 6),
+            "iv_transfer_points": len(self.iv_transfer),
+            "iv_output_points": len(self.iv_output),
+            "predicted_trends": self.predicted_trends,
+        }
+
+
+class SmartSample:
+    """
+    Physics-informed analytical model that generates expected device
+    characteristics from a DeviceDesign.
+
+    Uses long-channel MOSFET equations (level-1 SPICE equivalent)
+    corrected with short-channel heuristics for L < 100 nm.
+    """
+
+    _KT_q = 0.02585          # kT/q at 300 K  (V)
+    _mu_n = 450.0             # electron mobility cm²/V·s
+    _mu_p = 160.0             # hole mobility cm²/V·s
+    _eps_SiO2 = 3.9 * 8.854e-12   # F/m
+    _eps_HfO2 = 22.0 * 8.854e-12
+    _q = 1.6e-19
+    _ni = 1.45e10             # intrinsic carrier concentration cm⁻³
+
+    def _oxide_capacitance(self, design: DeviceDesign) -> float:
+        """Cox in F/cm² """
+        tox_cm = design.oxide_thickness_nm * 1e-9 * 100  # nm → cm
+        eps = (
+            self._eps_HfO2 if "hfo2" in design.oxide_material.lower()
+            else self._eps_SiO2
+        )
+        eps_cm = eps * 1e-2          # F/m → F/cm
+        return eps_cm / tox_cm
+
+    def _mobility(self, design: DeviceDesign) -> float:
+        """cm²/V·s — degraded slightly for thin oxides"""
+        mu0 = self._mu_n if design.channel_type != "P" else self._mu_p
+        tox_penalty = max(0.5, 1.0 - 0.01 * (5.0 - design.oxide_thickness_nm))
+        return mu0 * tox_penalty
+
+    def _ids_linear(
+        self, mu: float, cox: float, wl: float,
+        vgs: float, vth: float, vds: float
+    ) -> float:
+        """Drain current in linear region (A/µm-normalised)"""
+        if vgs < vth:
+            return 0.0
+        vdsat = vgs - vth
+        vds_eff = min(vds, vdsat)
+        return mu * cox * wl * ((vgs - vth) * vds_eff - 0.5 * vds_eff ** 2)
+
+    def _ids_saturation(
+        self, mu: float, cox: float, wl: float,
+        vgs: float, vth: float
+    ) -> float:
+        """Drain current in saturation (A/µm-normalised)"""
+        if vgs < vth:
+            return 0.0
+        return 0.5 * mu * cox * wl * (vgs - vth) ** 2
+
+    def _subthreshold_current(
+        self, vgs: float, vth: float, ss_V_dec: float, ioff: float
+    ) -> float:
+        """Subthreshold leakage"""
+        return ioff * 10 ** ((vgs - vth) / ss_V_dec)
+
+    def generate(
+        self,
+        design: DeviceDesign,
+        n_transfer_points: int = 20,
+        n_output_curves: int = 5,
+    ) -> DeviceCharacteristics:
+        char = DeviceCharacteristics()
+
+        cox = self._oxide_capacitance(design)
+        mu = self._mobility(design)
+        L_um = design.channel_length_nm * 1e-3   # nm → µm
+        W_um = design.channel_width_nm * 1e-3
+        wl = W_um / L_um
+
+        vdd = abs(design.supply_voltage_V)
+        sign = 1 if design.channel_type != "P" else -1
+        vth = design.vth_target_V
+
+        # --- subthreshold slope (ideal 60 mV/dec; degraded for short L) -----
+        n_body = 1.0 + max(0, (100 - design.channel_length_nm) / 200)
+        ss_V_dec = self._KT_q * math.log(10) * n_body
+        char.ss_mV_dec = ss_V_dec * 1000
+
+        # --- Ioff at VGS = 0 -------------------------------------------------
+        ioff_A = 1e-12 * (1.0 + max(0, 100 - design.channel_length_nm) * 5e-3)
+        char.ioff_A_um = ioff_A / W_um
+
+        # --- Ion at VGS = VDS = VDD ------------------------------------------
+        vgs_on = sign * vdd
+        vds_on = sign * vdd
+        if design.channel_type == "P":
+            ion = abs(self._ids_saturation(mu, cox, wl, abs(vgs_on), abs(vth)))
+        else:
+            ion = self._ids_saturation(mu, cox, wl, vgs_on, vth)
+        char.ion_A_um = max(ion, char.ioff_A_um * 10)
+        char.vth_V = vth
+        char.ion_ioff_ratio = char.ion_A_um / char.ioff_A_um
+
+        # --- Transfer curve (VGS sweep, VDS = VDD/2) -------------------------
+        vds_fixed = sign * vdd * 0.5
+        vgs_vals = [
+            sign * (i / (n_transfer_points - 1)) * vdd * 1.2
+            for i in range(n_transfer_points)
+        ]
+        for vgs in vgs_vals:
+            if abs(vgs) < abs(vth):
+                ids = self._subthreshold_current(
+                    abs(vgs), abs(vth), ss_V_dec, char.ioff_A_um * W_um
+                )
+            else:
+                ids = self._ids_saturation(mu, cox, wl, abs(vgs), abs(vth))
+            char.iv_transfer.append(
+                SamplePoint(vgs=round(vgs, 4), vds=round(vds_fixed, 4), ids=round(ids, 6))
+            )
+
+        # --- Output curves (VDS sweep for several VGS values) ----------------
+        for i in range(1, n_output_curves + 1):
+            vgs_val = sign * (i / n_output_curves) * vdd
+            n_vds = 15
+            for j in range(n_vds):
+                vds_val = sign * (j / (n_vds - 1)) * vdd
+                ids = self._ids_linear(
+                    mu, cox, wl, abs(vgs_val), abs(vth), abs(vds_val)
+                )
+                char.iv_output.append(
+                    SamplePoint(
+                        vgs=round(vgs_val, 4),
+                        vds=round(vds_val, 4),
+                        ids=round(ids, 6),
+                    )
+                )
+
+        # --- Power estimates -------------------------------------------------
+        freq = 1e9  # assume 1 GHz toggle
+        char.power_dynamic_uW = (
+            0.5 * cox * W_um * 1e-4 * L_um * 1e-4 * vdd ** 2 * freq * 1e6
+        )  # µW
+        char.power_static_uW = char.ioff_A_um * W_um * vdd * 1e6  # µW
+
+        # --- Trend predictions -----------------------------------------------
+        char.predicted_trends.append(
+            f"Expected Ion/Ioff ratio: ~{char.ion_ioff_ratio:.1e}"
+        )
+        if design.channel_length_nm < 50:
+            char.predicted_trends.append(
+                "Short-channel effects (SCE) expected — DIBL and Vth roll-off likely."
+            )
+        if design.oxide_thickness_nm < 2:
+            char.predicted_trends.append(
+                "Gate oxide tunnelling current may be significant (tox < 2 nm)."
+            )
+        if char.ss_mV_dec > 80:
+            char.predicted_trends.append(
+                "Subthreshold slope degraded by short-channel effects."
+            )
+
+        return char
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import json
+    from .intent2device import Intent2Device
+    from .device_architect import DeviceArchitect
+
+    reqs = Intent2Device().parse(
+        "I need a low-power NMOS with high drive current and low leakage."
+    )
+    design = DeviceArchitect().propose(reqs)
+    char = SmartSample().generate(design)
+    print(json.dumps(char.to_dict(), indent=2))
+
+
+
+"""
+Module 05 – SiliconSense
+Parameter-to-Physics Intelligence: explains how changing a physical
+parameter (e.g. oxide thickness) affects device parameters and
+electrical behaviour.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Callable
+
+from .device_architect import DeviceDesign
+from .smart_sample import SmartSample, DeviceCharacteristics
+
+
+@dataclass
+class PhysicsInsight:
+    parameter: str
+    original_value: float
+    new_value: float
+    unit: str
+    delta_vth_V: float = 0.0
+    delta_ion_pct: float = 0.0
+    delta_ioff_pct: float = 0.0
+    delta_ss_mV_dec: float = 0.0
+    qualitative_effects: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "parameter": self.parameter,
+            "change": f"{self.original_value} → {self.new_value} {self.unit}",
+            "delta_vth_V": round(self.delta_vth_V, 4),
+            "delta_ion_pct": round(self.delta_ion_pct, 2),
+            "delta_ioff_pct": round(self.delta_ioff_pct, 2),
+            "delta_ss_mV_dec": round(self.delta_ss_mV_dec, 2),
+            "qualitative_effects": self.qualitative_effects,
+        }
+
+
+# Map of parameter name → (getter, setter, unit)
+_PARAM_ACCESSORS: dict[
+    str, tuple[Callable[[DeviceDesign], float], Callable[[DeviceDesign, float], None], str]
+] = {
+    "oxide_thickness_nm": (
+        lambda d: d.oxide_thickness_nm,
+        lambda d, v: setattr(d, "oxide_thickness_nm", v),
+        "nm",
+    ),
+    "channel_length_nm": (
+        lambda d: d.channel_length_nm,
+        lambda d, v: setattr(d, "channel_length_nm", v),
+        "nm",
+    ),
+    "channel_width_nm": (
+        lambda d: d.channel_width_nm,
+        lambda d, v: setattr(d, "channel_width_nm", v),
+        "nm",
+    ),
+    "doping_channel_cm3": (
+        lambda d: d.doping_channel_cm3,
+        lambda d, v: setattr(d, "doping_channel_cm3", v),
+        "cm⁻³",
+    ),
+    "supply_voltage_V": (
+        lambda d: d.supply_voltage_V,
+        lambda d, v: setattr(d, "supply_voltage_V", v),
+        "V",
+    ),
+    "vth_target_V": (
+        lambda d: d.vth_target_V,
+        lambda d, v: setattr(d, "vth_target_V", v),
+        "V",
+    ),
+}
+
+
+def _clone_design(design: DeviceDesign) -> DeviceDesign:
+    """Shallow-copy a DeviceDesign."""
+    import copy
+    return copy.copy(design)
+
+
+class SiliconSense:
+    """
+    Performs a two-point parameter sweep to quantify how a single
+    physical parameter change propagates to device electrical metrics.
+    """
+
+    _sampler = SmartSample()
+
+    # --- qualitative knowledge base ----------------------------------------
+    _QUALITATIVE: dict[str, dict[str, list[str]]] = {
+        "oxide_thickness_nm": {
+            "decrease": [
+                "Stronger gate control (higher Cox → higher Ion).",
+                "Vth may decrease slightly.",
+                "Gate leakage risk increases due to direct tunnelling.",
+                "Gate capacitance increases.",
+            ],
+            "increase": [
+                "Weaker gate control (lower Cox → lower Ion).",
+                "Vth may increase slightly.",
+                "Gate leakage risk decreases.",
+                "Gate capacitance decreases.",
+            ],
+        },
+        "channel_length_nm": {
+            "decrease": [
+                "Short-channel effects (SCE) worsen — DIBL, Vth roll-off.",
+                "Ion increases due to higher electric field.",
+                "Ioff increases significantly.",
+                "Subthreshold slope degrades.",
+            ],
+            "increase": [
+                "Better SCE control — improved Vth stability.",
+                "Ion decreases (longer drift path).",
+                "Ioff decreases — better off-state leakage.",
+                "Subthreshold slope improves toward 60 mV/dec.",
+            ],
+        },
+        "doping_channel_cm3": {
+            "increase": [
+                "Higher Vth (body effect).",
+                "Reduced depletion width — better SCE control.",
+                "Mobility degradation due to impurity scattering.",
+                "Ioff decreases.",
+            ],
+            "decrease": [
+                "Lower Vth.",
+                "Wider depletion region.",
+                "Improved channel mobility.",
+                "Ioff may increase.",
+            ],
+        },
+        "channel_width_nm": {
+            "increase": [
+                "Ion increases linearly with width.",
+                "Ioff increases proportionally.",
+                "Power consumption increases.",
+            ],
+            "decrease": [
+                "Ion decreases.",
+                "Lower power consumption.",
+                "Narrow-width effect may shift Vth.",
+            ],
+        },
+    }
+
+    def analyze(
+        self,
+        design: DeviceDesign,
+        parameter: str,
+        new_value: float,
+    ) -> PhysicsInsight:
+        if parameter not in _PARAM_ACCESSORS:
+            raise ValueError(
+                f"Unknown parameter '{parameter}'. "
+                f"Supported: {list(_PARAM_ACCESSORS)}"
+            )
+
+        getter, setter, unit = _PARAM_ACCESSORS[parameter]
+        original_value = getter(design)
+
+        # --- simulate original ---
+        char_orig: DeviceCharacteristics = self._sampler.generate(design)
+
+        # --- simulate modified ---
+        modified = _clone_design(design)
+        setter(modified, new_value)
+        char_mod: DeviceCharacteristics = self._sampler.generate(modified)
+
+        def _pct(orig, new):
+            if orig == 0:
+                return 0.0
+            return (new - orig) / abs(orig) * 100
+
+        direction = "increase" if new_value > original_value else "decrease"
+        qual = self._QUALITATIVE.get(parameter, {}).get(direction, [])
+
+        return PhysicsInsight(
+            parameter=parameter,
+            original_value=original_value,
+            new_value=new_value,
+            unit=unit,
+            delta_vth_V=char_mod.vth_V - char_orig.vth_V,
+            delta_ion_pct=_pct(char_orig.ion_A_um, char_mod.ion_A_um),
+            delta_ioff_pct=_pct(char_orig.ioff_A_um, char_mod.ioff_A_um),
+            delta_ss_mV_dec=char_mod.ss_mV_dec - char_orig.ss_mV_dec,
+            qualitative_effects=qual,
+        )
+
+    def compare_parameter_sweep(
+        self,
+        design: DeviceDesign,
+        parameter: str,
+        values: list[float],
+    ) -> list[PhysicsInsight]:
+        return [self.analyze(design, parameter, v) for v in values]
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import json
+    from .intent2device import Intent2Device
+    from .device_architect import DeviceArchitect
+
+    reqs = Intent2Device().parse("I need a low-power NMOS with low leakage.")
+    design = DeviceArchitect().propose(reqs)
+
+    ss = SiliconSense()
+    insight = ss.analyze(design, "oxide_thickness_nm", 1.5)
+    print(json.dumps(insight.to_dict(), indent=2))
+
+
+
+"""
+Module 06 – SimuVision
+Intelligent Simulation Analyzer: automatically interprets simulation
+results (I-V data), extracts key metrics, and flags anomalies.
+
+Analyzes:
+  - I-V characteristics (transfer & output)
+  - Vth extraction (constant-current method)
+  - Ion / Ioff
+  - Subthreshold slope
+  - Leakage, power, delay, breakdown
+"""
+
+from __future__ import annotations
+import math
+from dataclasses import dataclass, field
+from typing import Optional
+
+from .smart_sample import SamplePoint
+
+
+@dataclass
+class SimulationAnalysis:
+    vth_V: Optional[float] = None
+    ion_A_um: Optional[float] = None
+    ioff_A_um: Optional[float] = None
+    ion_ioff_ratio: Optional[float] = None
+    ss_mV_dec: Optional[float] = None
+    peak_gm: Optional[float] = None           # transconductance A/V
+    leakage_floor_A_um: Optional[float] = None
+    breakdown_flag: bool = False
+    power_static_uW: Optional[float] = None
+    interpretation: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        def _fmt(v):
+            if v is None:
+                return "N/A"
+            if isinstance(v, float) and abs(v) < 1e-2:
+                return f"{v:.3e}"
+            return round(v, 4) if isinstance(v, float) else v
+
+        return {
+            "vth_V": _fmt(self.vth_V),
+            "ion_A_um": _fmt(self.ion_A_um),
+            "ioff_A_um": _fmt(self.ioff_A_um),
+            "ion_ioff_ratio": _fmt(self.ion_ioff_ratio),
+            "ss_mV_dec": _fmt(self.ss_mV_dec),
+            "peak_gm_A_V": _fmt(self.peak_gm),
+            "leakage_floor_A_um": _fmt(self.leakage_floor_A_um),
+            "breakdown_detected": self.breakdown_flag,
+            "power_static_uW": _fmt(self.power_static_uW),
+            "interpretation": self.interpretation,
+            "warnings": self.warnings,
+        }
+
+
+class SimuVision:
+    """
+    Accepts a list of SamplePoints (transfer curve) and an optional
+    output curve list, then extracts and interprets metrics.
+    """
+
+    _ICC_THRESHOLD = 1e-7  # A/µm – constant-current Vth method
+
+    def analyze_transfer(
+        self,
+        transfer_curve: list[SamplePoint],
+        vdd: float = 1.8,
+        width_um: float = 1.0,
+    ) -> SimulationAnalysis:
+        result = SimulationAnalysis()
+
+        if len(transfer_curve) < 4:
+            result.warnings.append("Too few data points for reliable extraction.")
+            return result
+
+        # Sort by |VGS|
+        curve = sorted(transfer_curve, key=lambda p: abs(p.vgs))
+        vgs_arr = [p.vgs for p in curve]
+        ids_arr = [max(abs(p.ids), 1e-20) for p in curve]
+
+        # --- Ioff: minimum current in transfer curve -------------------------
+        result.ioff_A_um = min(ids_arr)
+        result.leakage_floor_A_um = result.ioff_A_um
+
+        # --- Ion: maximum current in transfer curve --------------------------
+        result.ion_A_um = max(ids_arr)
+
+        # --- Vth: constant-current method (ICC = _ICC_THRESHOLD) -------------
+        for i in range(len(ids_arr) - 1):
+            if ids_arr[i] <= self._ICC_THRESHOLD <= ids_arr[i + 1]:
+                # linear interpolation
+                frac = (self._ICC_THRESHOLD - ids_arr[i]) / (
+                    ids_arr[i + 1] - ids_arr[i]
+                )
+                result.vth_V = vgs_arr[i] + frac * (vgs_arr[i + 1] - vgs_arr[i])
+                break
+
+        # --- Subthreshold slope from log(Id) vs VGS --------------------------
+        # Find subthreshold region: IDs below ICC * 100
+        sub_pts = [(vgs_arr[i], ids_arr[i]) for i in range(len(ids_arr))
+                   if ids_arr[i] < self._ICC_THRESHOLD * 100]
+        if len(sub_pts) >= 3:
+            log_ids = [math.log10(p[1]) for p in sub_pts]
+            vgs_sub = [p[0] for p in sub_pts]
+            # linear fit slope
+            n = len(sub_pts)
+            mx = sum(vgs_sub) / n
+            my = sum(log_ids) / n
+            num = sum((vgs_sub[i] - mx) * (log_ids[i] - my) for i in range(n))
+            den = sum((vgs_sub[i] - mx) ** 2 for i in range(n))
+            if den != 0:
+                slope_dec_V = num / den   # dec/V
+                if slope_dec_V != 0:
+                    result.ss_mV_dec = abs(1000 / slope_dec_V)
+
+        # --- Peak transconductance -------------------------------------------
+        gm_vals = []
+        for i in range(1, len(curve)):
+            d_ids = abs(ids_arr[i]) - abs(ids_arr[i - 1])
+            d_vgs = abs(vgs_arr[i]) - abs(vgs_arr[i - 1])
+            if d_vgs > 0:
+                gm_vals.append(d_ids / d_vgs)
+        result.peak_gm = max(gm_vals) if gm_vals else None
+
+        # --- Ion / Ioff ------------------------------------------------------
+        if result.ioff_A_um and result.ioff_A_um > 0:
+            result.ion_ioff_ratio = result.ion_A_um / result.ioff_A_um
+
+        # --- Breakdown detection: sudden current spike in output curve -------
+        # (simple heuristic: if max IDS > 5× expected saturation)
+        if result.ion_A_um > 1e-2:
+            result.breakdown_flag = True
+            result.warnings.append(
+                "Possible breakdown: unusually high drain current detected."
+            )
+
+        # --- Static power ----------------------------------------------------
+        result.power_static_uW = result.ioff_A_um * width_um * vdd * 1e6
+
+        # --- Interpretation summary ------------------------------------------
+        result.interpretation.append(
+            f"Vth extracted at ~{result.vth_V:.3f} V (constant-current method)."
+            if result.vth_V is not None else "Vth extraction inconclusive."
+        )
+        if result.ion_ioff_ratio:
+            quality = (
+                "excellent" if result.ion_ioff_ratio > 1e6
+                else "acceptable" if result.ion_ioff_ratio > 1e4
+                else "poor"
+            )
+            result.interpretation.append(
+                f"Ion/Ioff ratio {result.ion_ioff_ratio:.1e} — {quality}."
+            )
+        if result.ss_mV_dec:
+            if result.ss_mV_dec < 70:
+                result.interpretation.append(
+                    f"SS = {result.ss_mV_dec:.1f} mV/dec — near-ideal switching."
+                )
+            elif result.ss_mV_dec < 100:
+                result.interpretation.append(
+                    f"SS = {result.ss_mV_dec:.1f} mV/dec — acceptable."
+                )
+            else:
+                result.warnings.append(
+                    f"SS = {result.ss_mV_dec:.1f} mV/dec — degraded, check SCE."
+                )
+
+        return result
+
+    def analyze_output(
+        self,
+        output_curve: list[SamplePoint],
+    ) -> list[str]:
+        """
+        Checks output curve for compliance: saturation, linear region,
+        negative resistance (anomaly), kink effect.
+        """
+        observations = []
+        if not output_curve:
+            return ["No output curve data provided."]
+
+        # Group by VGS
+        vgs_groups: dict[float, list[SamplePoint]] = {}
+        for pt in output_curve:
+            vgs_groups.setdefault(round(pt.vgs, 4), []).append(pt)
+
+        for vgs, pts in sorted(vgs_groups.items()):
+            pts_sorted = sorted(pts, key=lambda p: abs(p.vds))
+            ids_vals = [abs(p.ids) for p in pts_sorted]
+            # Check for negative dIds/dVds (kink / breakdown)
+            dips = sum(
+                1 for i in range(1, len(ids_vals))
+                if ids_vals[i] < ids_vals[i - 1] * 0.95
+            )
+            if dips > 1:
+                observations.append(
+                    f"VGS={vgs:.3f}V: Non-monotonic IDS — possible kink effect or breakdown."
+                )
+            elif max(ids_vals) > 0 and ids_vals[-1] / max(ids_vals) > 0.98:
+                observations.append(
+                    f"VGS={vgs:.3f}V: Good saturation behaviour observed."
+                )
+        return observations
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import json
+    from .intent2device import Intent2Device
+    from .device_architect import DeviceArchitect
+    from .smart_sample import SmartSample
+
+    reqs = Intent2Device().parse("I need a low-power NMOS with high drive current and low leakage.")
+    design = DeviceArchitect().propose(reqs)
+    char = SmartSample().generate(design)
+
+    sv = SimuVision()
+    analysis = sv.analyze_transfer(char.iv_transfer, vdd=abs(design.supply_voltage_V))
+    print(json.dumps(analysis.to_dict(), indent=2))
+    print(sv.analyze_output(char.iv_output))
+
+
+"""
+Module 07 – ErrorRadar
+Error & Anomaly Detection: identifies abnormal, inconsistent, or
+unexpected simulation behaviour.
+
+Detects:
+  - Unexpected curves
+  - Parameter inconsistencies
+  - Deviations from expected behaviour
+  - Constraint violations
+  - Simulation anomalies
+
+Reports: what changed → where the deviation occurred →
+         possible cause → expected physical effect
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Optional
+
+from .smart_sample import DeviceCharacteristics, SamplePoint
+from .simu_vision import SimulationAnalysis
+
+
+@dataclass
+class Anomaly:
+    severity: str                        # "critical" | "warning" | "info"
+    location: str                        # e.g. "transfer curve", "Vth"
+    what_changed: str
+    possible_cause: str
+    expected_physical_effect: str
+
+    def to_dict(self) -> dict:
+        return {
+            "severity": self.severity,
+            "location": self.location,
+            "what_changed": self.what_changed,
+            "possible_cause": self.possible_cause,
+            "expected_physical_effect": self.expected_physical_effect,
+        }
+
+
+@dataclass
+class ErrorReport:
+    anomalies: list[Anomaly] = field(default_factory=list)
+    is_clean: bool = True
+
+    def add(self, anomaly: Anomaly):
+        self.anomalies.append(anomaly)
+        self.is_clean = False
+
+    def to_dict(self) -> dict:
+        return {
+            "is_clean": self.is_clean,
+            "anomaly_count": len(self.anomalies),
+            "anomalies": [a.to_dict() for a in self.anomalies],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Thresholds
+# ---------------------------------------------------------------------------
+_THRESHOLDS = {
+    "min_ion_ioff": 1e3,       # minimum acceptable Ion/Ioff
+    "max_ss_mV_dec": 200.0,    # SS above this suggests severe SCE or bad data
+    "max_leakage_A_um": 1e-6,  # absolute leakage ceiling
+    "max_vth_drift_V": 0.15,   # Vth shift vs design target (V)
+    "min_gm_A_V": 1e-6,        # transconductance floor
+    "max_negative_dids": 2,    # allowed non-monotonic points before kink flag
+}
+
+
+class ErrorRadar:
+    """
+    Cross-checks simulation analysis against design targets and
+    physics rules to raise structured anomaly reports.
+    """
+
+    def check(
+        self,
+        analysis: SimulationAnalysis,
+        expected: Optional[DeviceCharacteristics] = None,
+        vth_target: Optional[float] = None,
+        max_leakage: Optional[float] = None,
+    ) -> ErrorReport:
+        report = ErrorReport()
+
+        # --- 1. Ion/Ioff check -----------------------------------------------
+        if analysis.ion_ioff_ratio is not None:
+            if analysis.ion_ioff_ratio < _THRESHOLDS["min_ion_ioff"]:
+                report.add(Anomaly(
+                    severity="critical",
+                    location="Ion/Ioff ratio",
+                    what_changed=f"Ion/Ioff = {analysis.ion_ioff_ratio:.1e}",
+                    possible_cause=(
+                        "Excessive leakage, too-short channel, or too-low Vth"
+                    ),
+                    expected_physical_effect=(
+                        "Device cannot distinguish on/off states; high standby power"
+                    ),
+                ))
+
+        # --- 2. Subthreshold slope -------------------------------------------
+        if analysis.ss_mV_dec is not None:
+            if analysis.ss_mV_dec > _THRESHOLDS["max_ss_mV_dec"]:
+                report.add(Anomaly(
+                    severity="critical",
+                    location="Subthreshold slope",
+                    what_changed=f"SS = {analysis.ss_mV_dec:.1f} mV/dec",
+                    possible_cause=(
+                        "Severe short-channel effects, high interface trap density, "
+                        "or numerical simulation error"
+                    ),
+                    expected_physical_effect=(
+                        "Very gradual turn-on, high switching power, poor noise margin"
+                    ),
+                ))
+            elif analysis.ss_mV_dec > 100:
+                report.add(Anomaly(
+                    severity="warning",
+                    location="Subthreshold slope",
+                    what_changed=f"SS = {analysis.ss_mV_dec:.1f} mV/dec",
+                    possible_cause="Moderate short-channel effects or body-bias mismatch",
+                    expected_physical_effect="Slightly degraded switching efficiency",
+                ))
+
+        # --- 3. Leakage ceiling ----------------------------------------------
+        ceiling = max_leakage or _THRESHOLDS["max_leakage_A_um"]
+        if analysis.ioff_A_um is not None and analysis.ioff_A_um > ceiling:
+            report.add(Anomaly(
+                severity="critical",
+                location="Off-state leakage (Ioff)",
+                what_changed=f"Ioff = {analysis.ioff_A_um:.2e} A/µm",
+                possible_cause=(
+                    "Channel too short, Vth too low, or high sub-surface leakage path"
+                ),
+                expected_physical_effect=(
+                    "High standby power consumption; battery life degradation"
+                ),
+            ))
+
+        # --- 4. Vth drift vs design target -----------------------------------
+        if vth_target is not None and analysis.vth_V is not None:
+            drift = abs(analysis.vth_V - vth_target)
+            if drift > _THRESHOLDS["max_vth_drift_V"]:
+                report.add(Anomaly(
+                    severity="warning",
+                    location="Threshold voltage (Vth)",
+                    what_changed=(
+                        f"Extracted Vth = {analysis.vth_V:.3f} V, "
+                        f"target = {vth_target:.3f} V (Δ = {drift:.3f} V)"
+                    ),
+                    possible_cause=(
+                        "Work-function mismatch, doping gradient, oxide charge, "
+                        "or process variation"
+                    ),
+                    expected_physical_effect=(
+                        "Circuit logic levels shifted; may cause functional failures"
+                    ),
+                ))
+
+        # --- 5. Peak gm floor ------------------------------------------------
+        if analysis.peak_gm is not None:
+            if analysis.peak_gm < _THRESHOLDS["min_gm_A_V"]:
+                report.add(Anomaly(
+                    severity="warning",
+                    location="Peak transconductance (gm)",
+                    what_changed=f"gm_peak = {analysis.peak_gm:.2e} A/V",
+                    possible_cause=(
+                        "Very low mobility, thick oxide, or near-pinch-off operation"
+                    ),
+                    expected_physical_effect=(
+                        "Weak amplification capability; poor frequency response"
+                    ),
+                ))
+
+        # --- 6. Breakdown flag -----------------------------------------------
+        if analysis.breakdown_flag:
+            report.add(Anomaly(
+                severity="critical",
+                location="Breakdown region",
+                what_changed="Current spike detected at high VDS",
+                possible_cause=(
+                    "Avalanche breakdown, GIDL, or punch-through"
+                ),
+                expected_physical_effect="Device damage; unreliable operation at high bias",
+            ))
+
+        # --- 7. Compare against expected characteristics if provided ---------
+        if expected is not None:
+            if analysis.ion_A_um and expected.ion_A_um:
+                ion_dev = abs(analysis.ion_A_um - expected.ion_A_um) / expected.ion_A_um
+                if ion_dev > 0.3:
+                    report.add(Anomaly(
+                        severity="warning",
+                        location="On-current (Ion)",
+                        what_changed=(
+                            f"Simulated Ion = {analysis.ion_A_um:.2e} A/µm, "
+                            f"expected = {expected.ion_A_um:.2e} A/µm "
+                            f"({ion_dev*100:.0f}% deviation)"
+                        ),
+                        possible_cause=(
+                            "Mobility model mismatch, unexpected velocity saturation, "
+                            "or parameter extraction error"
+                        ),
+                        expected_physical_effect=(
+                            "Drive strength different from design intent"
+                        ),
+                    ))
+
+        return report
+
+    def check_parameter_consistency(
+        self,
+        channel_length_nm: float,
+        oxide_thickness_nm: float,
+        doping_channel_cm3: float,
+        supply_voltage_V: float,
+        vth_target_V: float,
+    ) -> ErrorReport:
+        """
+        Checks whether the combination of design parameters is
+        physically self-consistent before simulation.
+        """
+        report = ErrorReport()
+
+        # Oxide thickness vs channel length scaling rule
+        tox_min_rule = channel_length_nm / 50
+        if oxide_thickness_nm > channel_length_nm / 10:
+            report.add(Anomaly(
+                severity="warning",
+                location="Oxide thickness / channel length ratio",
+                what_changed=(
+                    f"tox = {oxide_thickness_nm} nm, L = {channel_length_nm} nm"
+                ),
+                possible_cause=(
+                    "Oxide is too thick relative to channel length (scalability rule)"
+                ),
+                expected_physical_effect=(
+                    "Poor gate control, high Vth, degraded short-channel performance"
+                ),
+            ))
+
+        # VDD vs Vth margin
+        if abs(supply_voltage_V) < abs(vth_target_V) * 1.3:
+            report.add(Anomaly(
+                severity="critical",
+                location="Supply voltage margin",
+                what_changed=(
+                    f"VDD = {supply_voltage_V} V, Vth = {vth_target_V} V"
+                ),
+                possible_cause="Supply voltage too close to threshold voltage",
+                expected_physical_effect=(
+                    "Device may not fully switch on; severe Ion degradation"
+                ),
+            ))
+
+        # Doping sanity
+        if doping_channel_cm3 < 1e14 or doping_channel_cm3 > 1e19:
+            report.add(Anomaly(
+                severity="warning",
+                location="Channel doping",
+                what_changed=f"Na = {doping_channel_cm3:.2e} cm⁻³",
+                possible_cause="Channel doping outside physically realistic range",
+                expected_physical_effect=(
+                    "Simulation may produce non-physical results"
+                ),
+            ))
+
+        return report
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import json
+    from .intent2device import Intent2Device
+    from .device_architect import DeviceArchitect
+    from .smart_sample import SmartSample
+    from .simu_vision import SimuVision
+
+    reqs = Intent2Device().parse("I need a low-power NMOS with high drive current and low leakage.")
+    design = DeviceArchitect().propose(reqs)
+    char = SmartSample().generate(design)
+    analysis = SimuVision().analyze_transfer(char.iv_transfer, vdd=abs(design.supply_voltage_V))
+
+    radar = ErrorRadar()
+    report = radar.check(analysis, expected=char, vth_target=design.vth_target_V)
+    print(json.dumps(report.to_dict(), indent=2))
+
+
+"""
+Module 08 – OptiLoop
+AI Optimization Assistant: compares Target vs Expected vs TCAD simulation
+results and recommends parameter modifications to bring the device
+toward specification.
+
+Compares:
+  - Leakage (Ioff)
+  - On-current (Ion)
+  - Threshold voltage (Vth)
+  - Power consumption
+
+Returns Accept / Modify / Reject + recommended parameter modifications.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+from .smart_sample import DeviceCharacteristics
+from .simu_vision import SimulationAnalysis
+from .device_architect import DeviceDesign
+
+
+class Verdict(str, Enum):
+    ACCEPT = "ACCEPT"
+    MODIFY = "MODIFY"
+    REJECT = "REJECT"
+
+
+@dataclass
+class TargetSpec:
+    """Engineer-defined performance targets."""
+    max_ioff_A_um: Optional[float] = None       # A/µm
+    min_ion_A_um: Optional[float] = None        # A/µm
+    vth_V: Optional[float] = None               # V (nominal)
+    vth_tolerance_V: float = 0.05               # ±V
+    max_power_static_uW: Optional[float] = None # µW
+    min_ion_ioff_ratio: Optional[float] = None
+    max_ss_mV_dec: Optional[float] = 100.0
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items() if v is not None}
+
+
+@dataclass
+class Modification:
+    parameter: str
+    current_value: float
+    suggested_value: float
+    unit: str
+    reason: str
+
+    def to_dict(self) -> dict:
+        direction = "↑" if self.suggested_value > self.current_value else "↓"
+        return {
+            "parameter": self.parameter,
+            "current": f"{self.current_value} {self.unit}",
+            "suggested": f"{self.suggested_value} {self.unit} {direction}",
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class OptimizationResult:
+    verdict: Verdict = Verdict.ACCEPT
+    score: float = 1.0                   # 0–1, how well spec is met
+    violations: list[str] = field(default_factory=list)
+    modifications: list[Modification] = field(default_factory=list)
+    summary: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "verdict": self.verdict.value,
+            "score": round(self.score, 3),
+            "violations": self.violations,
+            "modifications": [m.to_dict() for m in self.modifications],
+            "summary": self.summary,
+        }
+
+
+class OptiLoop:
+    """
+    Rule-based optimization engine that iteratively suggests single-
+    parameter modifications to resolve specification violations.
+    """
+
+    _MAX_ITERATIONS = 5
+
+    def optimize(
+        self,
+        design: DeviceDesign,
+        analysis: SimulationAnalysis,
+        spec: TargetSpec,
+        expected: Optional[DeviceCharacteristics] = None,
+    ) -> OptimizationResult:
+        result = OptimizationResult()
+        penalties: list[float] = []
+
+        # ------------------------------------------------------------------ #
+        # 1. Check each spec metric                                           #
+        # ------------------------------------------------------------------ #
+
+        # --- Leakage (Ioff) ---
+        if spec.max_ioff_A_um and analysis.ioff_A_um:
+            if analysis.ioff_A_um > spec.max_ioff_A_um:
+                excess_factor = analysis.ioff_A_um / spec.max_ioff_A_um
+                result.violations.append(
+                    f"Leakage too high: {analysis.ioff_A_um:.2e} A/µm "
+                    f"(limit {spec.max_ioff_A_um:.2e}, ×{excess_factor:.1f})"
+                )
+                penalties.append(min(excess_factor - 1, 1.0))
+
+                # Suggest: increase Vth via doping or longer channel
+                new_L = min(design.channel_length_nm * 1.1, 500.0)
+                result.modifications.append(Modification(
+                    parameter="channel_length_nm",
+                    current_value=design.channel_length_nm,
+                    suggested_value=round(new_L, 1),
+                    unit="nm",
+                    reason="Longer channel reduces DIBL and subthreshold leakage.",
+                ))
+                new_doping = design.doping_channel_cm3 * 1.2
+                result.modifications.append(Modification(
+                    parameter="doping_channel_cm3",
+                    current_value=design.doping_channel_cm3,
+                    suggested_value=round(new_doping, 2),
+                    unit="cm⁻³",
+                    reason="Higher channel doping raises Vth, suppressing Ioff.",
+                ))
+
+        # --- On-current (Ion) ---
+        if spec.min_ion_A_um and analysis.ion_A_um:
+            if analysis.ion_A_um < spec.min_ion_A_um:
+                deficit_factor = spec.min_ion_A_um / analysis.ion_A_um
+                result.violations.append(
+                    f"Ion too low: {analysis.ion_A_um:.2e} A/µm "
+                    f"(need ≥ {spec.min_ion_A_um:.2e}, ×{deficit_factor:.1f} short)"
+                )
+                penalties.append(min(deficit_factor - 1, 1.0))
+
+                # Suggest: wider device, shorter channel, thinner oxide
+                new_W = design.channel_width_nm * deficit_factor ** 0.5
+                result.modifications.append(Modification(
+                    parameter="channel_width_nm",
+                    current_value=design.channel_width_nm,
+                    suggested_value=round(new_W, 1),
+                    unit="nm",
+                    reason="Wider channel increases Ion proportionally.",
+                ))
+                new_tox = max(0.8, design.oxide_thickness_nm * 0.9)
+                result.modifications.append(Modification(
+                    parameter="oxide_thickness_nm",
+                    current_value=design.oxide_thickness_nm,
+                    suggested_value=round(new_tox, 2),
+                    unit="nm",
+                    reason="Thinner oxide boosts Cox and gate drive.",
+                ))
+
+        # --- Threshold voltage (Vth) ---
+        if spec.vth_V is not None and analysis.vth_V is not None:
+            drift = analysis.vth_V - spec.vth_V
+            if abs(drift) > spec.vth_tolerance_V:
+                result.violations.append(
+                    f"Vth slightly high: {analysis.vth_V:.3f} V "
+                    f"(target {spec.vth_V:.3f} V, Δ={drift:+.3f} V)"
+                    if drift > 0
+                    else f"Vth slightly low: {analysis.vth_V:.3f} V "
+                    f"(target {spec.vth_V:.3f} V, Δ={drift:+.3f} V)"
+                )
+                penalties.append(abs(drift) / spec.vth_tolerance_V * 0.3)
+
+                # Suggest: adjust channel doping
+                doping_delta = 1.1 if drift < 0 else 0.9
+                new_doping = design.doping_channel_cm3 * doping_delta
+                result.modifications.append(Modification(
+                    parameter="doping_channel_cm3",
+                    current_value=design.doping_channel_cm3,
+                    suggested_value=round(new_doping, 2),
+                    unit="cm⁻³",
+                    reason=(
+                        "Adjust channel doping to tune Vth toward target. "
+                        f"{'Increase' if drift < 0 else 'Decrease'} doping "
+                        f"to {'raise' if drift < 0 else 'lower'} Vth."
+                    ),
+                ))
+
+        # --- Subthreshold slope ---
+        if spec.max_ss_mV_dec and analysis.ss_mV_dec:
+            if analysis.ss_mV_dec > spec.max_ss_mV_dec:
+                result.violations.append(
+                    f"SS = {analysis.ss_mV_dec:.1f} mV/dec "
+                    f"(limit {spec.max_ss_mV_dec:.0f} mV/dec)"
+                )
+                penalties.append(
+                    (analysis.ss_mV_dec - spec.max_ss_mV_dec) / spec.max_ss_mV_dec
+                )
+                new_L = min(design.channel_length_nm * 1.15, 500.0)
+                result.modifications.append(Modification(
+                    parameter="channel_length_nm",
+                    current_value=design.channel_length_nm,
+                    suggested_value=round(new_L, 1),
+                    unit="nm",
+                    reason=(
+                        "Longer channel reduces short-channel effects "
+                        "and improves subthreshold slope."
+                    ),
+                ))
+
+        # --- Power ---
+        if spec.max_power_static_uW and analysis.power_static_uW:
+            if analysis.power_static_uW > spec.max_power_static_uW:
+                result.violations.append(
+                    f"Static power too high: {analysis.power_static_uW:.4f} µW "
+                    f"(limit {spec.max_power_static_uW:.4f} µW)"
+                )
+                penalties.append(
+                    analysis.power_static_uW / spec.max_power_static_uW - 1
+                )
+
+        # ------------------------------------------------------------------ #
+        # 2. Compute overall score and verdict                                #
+        # ------------------------------------------------------------------ #
+        if penalties:
+            result.score = max(0.0, 1.0 - sum(penalties) / len(penalties))
+        else:
+            result.score = 1.0
+
+        if not result.violations:
+            result.verdict = Verdict.ACCEPT
+            result.summary = "All specification targets met. Design is accepted."
+        elif result.score >= 0.6:
+            result.verdict = Verdict.MODIFY
+            result.summary = (
+                "Device is close to target but requires parameter adjustment. "
+                "Apply suggested modifications and re-simulate."
+            )
+        else:
+            result.verdict = Verdict.REJECT
+            result.summary = (
+                "Significant specification violations detected. "
+                "Major design revision required before re-simulation."
+            )
+
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import json
+    from .intent2device import Intent2Device
+    from .device_architect import DeviceArchitect
+    from .smart_sample import SmartSample
+    from .simu_vision import SimuVision
+
+    reqs = Intent2Device().parse("I need a low-power NMOS with high drive current and low leakage.")
+    design = DeviceArchitect().propose(reqs)
+    char = SmartSample().generate(design)
+    analysis = SimuVision().analyze_transfer(char.iv_transfer, vdd=abs(design.supply_voltage_V))
+
+    spec = TargetSpec(
+        max_ioff_A_um=1e-10,
+        min_ion_A_um=1e-5,
+        vth_V=design.vth_target_V,
+        max_ss_mV_dec=90,
+    )
+    opt = OptiLoop().optimize(design, analysis, spec, expected=char)
+    print(json.dumps(opt.to_dict(), indent=2))
+
+
+
+"""
+Module 09 – Engineer-in-the-Loop
+Validation & Decision: presents all AI-generated predictions, analyses,
+and recommendations to the engineer and collects a final decision
+(Accept / Modify / Reject) with optional override parameters.
+
+SemiGen AI provides:
+  Prediction + Analysis + Physical Explanation + Optimization Recommendation
+
+Engineer provides:
+  Validation + Engineering Judgment + Final Decision
+
+SemiGen AI assists — it does NOT replace the engineer.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+from .intent2device import DeviceRequirements
+from .device_architect import DeviceDesign
+from .smart_sample import DeviceCharacteristics
+from .simu_vision import SimulationAnalysis
+from .error_radar import ErrorReport
+from .opti_loop import OptimizationResult, Verdict, TargetSpec
+
+
+class EngineerDecision(str, Enum):
+    ACCEPT = "ACCEPT"
+    MODIFY = "MODIFY"
+    REJECT = "REJECT"
+
+
+@dataclass
+class DesignSession:
+    """Holds the full state of one design iteration."""
+    session_id: str
+    timestamp: str
+    requirements: Optional[DeviceRequirements] = None
+    design: Optional[DeviceDesign] = None
+    characteristics: Optional[DeviceCharacteristics] = None
+    analysis: Optional[SimulationAnalysis] = None
+    error_report: Optional[ErrorReport] = None
+    optimization: Optional[OptimizationResult] = None
+    engineer_decision: Optional[EngineerDecision] = None
+    engineer_notes: str = ""
+    manual_overrides: dict = field(default_factory=dict)
+    iteration: int = 1
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "timestamp": self.timestamp,
+            "iteration": self.iteration,
+            "requirements": self.requirements.to_dict() if self.requirements else None,
+            "design": self.design.to_dict() if self.design else None,
+            "ai_recommendation": (
+                self.optimization.verdict.value if self.optimization else "N/A"
+            ),
+            "engineer_decision": (
+                self.engineer_decision.value if self.engineer_decision else "PENDING"
+            ),
+            "engineer_notes": self.engineer_notes,
+            "manual_overrides": self.manual_overrides,
+            "anomaly_count": (
+                len(self.error_report.anomalies) if self.error_report else 0
+            ),
+        }
+
+
+class EngineerInTheLoop:
+    """
+    Orchestrates the engineer review step.
+
+    Presents a concise briefing of all AI findings, then accepts
+    the engineer's decision and any manual parameter overrides.
+    The updated design is returned for the next iteration.
+    """
+
+    def generate_briefing(self, session: DesignSession) -> str:
+        lines = [
+            "=" * 70,
+            f"  SEMIGEN AI — ENGINEER REVIEW BRIEFING",
+            f"  Session: {session.session_id}  |  Iteration: {session.iteration}",
+            f"  {session.timestamp}",
+            "=" * 70,
+        ]
+
+        # Requirements
+        if session.requirements:
+            r = session.requirements
+            lines += [
+                "",
+                "[ REQUIREMENTS ]",
+                f"  Device       : {r.device_type} ({r.channel_type}-channel)",
+                f"  Power class  : {r.power_class}",
+                f"  Drive current: {r.drive_current}",
+                f"  Leakage      : {r.leakage_target}",
+                f"  Application  : {r.application or 'unspecified'}",
+            ]
+
+        # Design parameters
+        if session.design:
+            d = session.design
+            lines += [
+                "",
+                "[ PROPOSED DESIGN ]",
+                f"  Architecture       : {d.architecture}",
+                f"  Channel length     : {d.channel_length_nm} nm",
+                f"  Channel width      : {d.channel_width_nm} nm",
+                f"  Oxide thickness    : {d.oxide_thickness_nm} nm ({d.oxide_material})",
+                f"  Channel doping     : {d.doping_channel_cm3:.2e} cm⁻³",
+                f"  Supply voltage     : {d.supply_voltage_V} V",
+                f"  Vth target         : {d.vth_target_V} V",
+            ]
+
+        # Simulation analysis
+        if session.analysis:
+            a = session.analysis
+            lines += [
+                "",
+                "[ SIMULATION ANALYSIS ]",
+                f"  Vth extracted : {a.vth_V:.3f} V" if a.vth_V else "  Vth: N/A",
+                f"  Ion           : {a.ion_A_um:.3e} A/µm" if a.ion_A_um else "  Ion: N/A",
+                f"  Ioff          : {a.ioff_A_um:.3e} A/µm" if a.ioff_A_um else "  Ioff: N/A",
+                f"  Ion/Ioff      : {a.ion_ioff_ratio:.2e}" if a.ion_ioff_ratio else "  Ion/Ioff: N/A",
+                f"  SS            : {a.ss_mV_dec:.1f} mV/dec" if a.ss_mV_dec else "  SS: N/A",
+                f"  Static power  : {a.power_static_uW:.4f} µW" if a.power_static_uW else "",
+            ]
+            for interp in a.interpretation:
+                lines.append(f"  ↳ {interp}")
+            for warn in a.warnings:
+                lines.append(f"  ⚠ {warn}")
+
+        # Error report
+        if session.error_report:
+            er = session.error_report
+            if er.is_clean:
+                lines += ["", "[ ERROR RADAR ] ✓ No anomalies detected."]
+            else:
+                lines += ["", f"[ ERROR RADAR ] {len(er.anomalies)} anomaly(ies) detected:"]
+                for anomaly in er.anomalies:
+                    lines.append(
+                        f"  [{anomaly.severity.upper()}] {anomaly.location}: "
+                        f"{anomaly.what_changed}"
+                    )
+                    lines.append(f"    Cause  : {anomaly.possible_cause}")
+                    lines.append(f"    Effect : {anomaly.expected_physical_effect}")
+
+        # Optimization recommendation
+        if session.optimization:
+            opt = session.optimization
+            lines += [
+                "",
+                f"[ OPTLOOP RECOMMENDATION ] → {opt.verdict.value}",
+                f"  Score  : {opt.score:.2f}",
+                f"  Summary: {opt.summary}",
+            ]
+            if opt.modifications:
+                lines.append("  Suggested modifications:")
+                for mod in opt.modifications:
+                    lines.append(
+                        f"    • {mod.parameter}: {mod.current_value} → "
+                        f"{mod.suggested_value} {mod.unit}  ({mod.reason})"
+                    )
+
+        lines += [
+            "",
+            "=" * 70,
+            "  AI RECOMMENDATION: "
+            + (session.optimization.verdict.value if session.optimization else "N/A"),
+            "  Awaiting engineer decision: ACCEPT | MODIFY | REJECT",
+            "=" * 70,
+        ]
+        return "\n".join(lines)
+
+    def record_decision(
+        self,
+        session: DesignSession,
+        decision: EngineerDecision,
+        notes: str = "",
+        overrides: Optional[dict] = None,
+    ) -> DesignSession:
+        """
+        Record the engineer's final decision.
+        If MODIFY, optionally apply manual overrides to the design.
+        Returns an updated session (ready for next iteration if MODIFY).
+        """
+        session.engineer_decision = decision
+        session.engineer_notes = notes
+        if overrides:
+            session.manual_overrides = overrides
+            if session.design:
+                for param, value in overrides.items():
+                    if hasattr(session.design, param):
+                        setattr(session.design, param, value)
+                        session.design.notes.append(
+                            f"[Iteration {session.iteration}] Engineer override: "
+                            f"{param} = {value}"
+                        )
+
+        if decision == EngineerDecision.MODIFY:
+            session.iteration += 1
+            # Reset analysis fields for re-simulation
+            session.analysis = None
+            session.error_report = None
+            session.optimization = None
+
+        return session
+
+
+# ---------------------------------------------------------------------------
+# Session factory helper
+# ---------------------------------------------------------------------------
+def new_session(session_id: Optional[str] = None) -> DesignSession:
+    import uuid
+    return DesignSession(
+        session_id=session_id or str(uuid.uuid4())[:8],
+        timestamp=datetime.now().isoformat(timespec="seconds"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import json
+    from .intent2device import Intent2Device
+    from .device_architect import DeviceArchitect
+    from .smart_sample import SmartSample
+    from .simu_vision import SimuVision
+    from .error_radar import ErrorRadar
+    from .opti_loop import OptiLoop, TargetSpec
+
+    session = new_session("demo-01")
+    session.requirements = Intent2Device().parse(
+        "I need a low-power NMOS with high drive current and low leakage."
+    )
+    session.design = DeviceArchitect().propose(session.requirements)
+    session.characteristics = SmartSample().generate(session.design)
+    session.analysis = SimuVision().analyze_transfer(
+        session.characteristics.iv_transfer,
+        vdd=abs(session.design.supply_voltage_V),
+    )
+    session.error_report = ErrorRadar().check(
+        session.analysis,
+        expected=session.characteristics,
+        vth_target=session.design.vth_target_V,
+    )
+    spec = TargetSpec(
+        max_ioff_A_um=1e-10,
+        min_ion_A_um=1e-5,
+        vth_V=session.design.vth_target_V,
+        max_ss_mV_dec=90,
+    )
+    session.optimization = OptiLoop().optimize(
+        session.design, session.analysis, spec, expected=session.characteristics
+    )
+
+    eitl = EngineerInTheLoop()
+    print(eitl.generate_briefing(session))
+
+    # Simulate engineer deciding to modify
+    session = eitl.record_decision(
+        session,
+        decision=EngineerDecision.MODIFY,
+        notes="Increase channel length to reduce leakage.",
+        overrides={"channel_length_nm": session.design.channel_length_nm * 1.1},
+    )
+    print(f"\nEngineer decision recorded. Next iteration: {session.iteration}")
+    print(json.dumps(session.to_dict(), indent=2))
+
+
+"""
+semigen_ai/modules — public API
+"""
+
+from .intent2device import Intent2Device, DeviceRequirements
+from .device_architect import DeviceArchitect, DeviceDesign
+from .smart_sample import SmartSample, DeviceCharacteristics, SamplePoint
+from .silicon_sense import SiliconSense, PhysicsInsight
+from .simu_vision import SimuVision, SimulationAnalysis
+from .error_radar import ErrorRadar, ErrorReport, Anomaly
+from .opti_loop import OptiLoop, OptimizationResult, TargetSpec, Verdict
+from .engineer_in_the_loop import (
+    EngineerInTheLoop,
+    EngineerDecision,
+    DesignSession,
+    new_session,
+)
+
+__all__ = [
+    "Intent2Device", "DeviceRequirements",
+    "DeviceArchitect", "DeviceDesign",
+    "SmartSample", "DeviceCharacteristics", "SamplePoint",
+    "SiliconSense", "PhysicsInsight",
+    "SimuVision", "SimulationAnalysis",
+    "ErrorRadar", "ErrorReport", "Anomaly",
+    "OptiLoop", "OptimizationResult", "TargetSpec", "Verdict",
+    "EngineerInTheLoop", "EngineerDecision", "DesignSession", "new_session",
+]
+
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SemiGen AI — Main integration entry point.
+
+Runs a complete design-evaluation-optimization cycle for a device
+described in natural language, then presents the engineer briefing.
+
+Usage:
+    python main.py
+    python main.py --desc "low-power PMOS for IoT" --max-ioff 1e-11
+
+"""
+
+from __future__ import annotations
+import argparse
+import io
+import json
+import sys
+
+# Ensure UTF-8 output on Windows consoles
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+from semigen_ai import (
+    Intent2Device,
+    DeviceArchitect,
+    SmartSample,
+    SiliconSense,
+    SimuVision,
+    ErrorRadar,
+    OptiLoop, TargetSpec,
+    EngineerInTheLoop, EngineerDecision,
+    new_session,
+)
+
+
+def run_pipeline(
+    description: str,
+    target_spec: TargetSpec,
+    auto_decision: str = "MODIFY",
+    print_briefing: bool = True,
+) -> dict:
+    """
+    Execute the full SemiGen AI pipeline for one design iteration.
+
+    Returns a summary dict with all key results.
+    """
+
+    # ── Module 01: Intent2Device ──────────────────────────────────────────
+    print("\n[M01] Intent2Device — parsing requirements…")
+    requirements = Intent2Device().parse(description)
+    print(f"  → Device: {requirements.device_type} ({requirements.channel_type})")
+    print(f"  → Power: {requirements.power_class}  |  Leakage: {requirements.leakage_target}")
+
+    # ── Module 02: Device Architect ───────────────────────────────────────
+    print("\n[M02] Device Architect — proposing design…")
+    design = DeviceArchitect().propose(requirements)
+    print(f"  → Architecture  : {design.architecture}")
+    print(f"  → Channel length: {design.channel_length_nm} nm")
+    print(f"  → Oxide (tox)   : {design.oxide_thickness_nm} nm ({design.oxide_material})")
+    print(f"  → Vth target    : {design.vth_target_V} V")
+
+    # ── Module 04: SmartSample ────────────────────────────────────────────
+    print("\n[M04] SmartSample — generating expected I-V characteristics…")
+    char = SmartSample().generate(design)
+    print(f"  → Ion  : {char.ion_A_um:.3e} A/µm")
+    print(f"  → Ioff : {char.ioff_A_um:.3e} A/µm")
+    print(f"  → Ion/Ioff ratio: {char.ion_ioff_ratio:.2e}")
+    print(f"  → Transfer curve points: {len(char.iv_transfer)}")
+
+    # ── Module 05: SiliconSense (oxide thickness demo) ────────────────────
+    print("\n[M05] SiliconSense — parameter sensitivity analysis (tox)…")
+    ss = SiliconSense()
+    insight = ss.analyze(design, "oxide_thickness_nm", design.oxide_thickness_nm * 0.75)
+    print(f"  → tox {insight.original_value:.1f}→{insight.new_value:.1f} nm: "
+          f"ΔIon={insight.delta_ion_pct:+.1f}%  "
+          f"ΔIoff={insight.delta_ioff_pct:+.1f}%")
+    for eff in insight.qualitative_effects[:2]:
+        print(f"     • {eff}")
+
+    # ── Module 06: SimuVision ─────────────────────────────────────────────
+    print("\n[M06] SimuVision — analyzing simulation results…")
+    sv = SimuVision()
+    analysis = sv.analyze_transfer(char.iv_transfer, vdd=abs(design.supply_voltage_V))
+    output_obs = sv.analyze_output(char.iv_output)
+    print(f"  → Vth extracted: {analysis.vth_V:.3f} V" if analysis.vth_V else "  → Vth: N/A")
+    print(f"  → SS           : {analysis.ss_mV_dec:.1f} mV/dec" if analysis.ss_mV_dec else "")
+    for obs in output_obs[:2]:
+        print(f"  → Output: {obs}")
+
+    # ── Module 07: ErrorRadar ─────────────────────────────────────────────
+    print("\n[M07] ErrorRadar — checking for anomalies…")
+    radar = ErrorRadar()
+    error_report = radar.check(analysis, expected=char, vth_target=design.vth_target_V)
+    param_report = radar.check_parameter_consistency(
+        channel_length_nm=design.channel_length_nm,
+        oxide_thickness_nm=design.oxide_thickness_nm,
+        doping_channel_cm3=design.doping_channel_cm3,
+        supply_voltage_V=design.supply_voltage_V,
+        vth_target_V=design.vth_target_V,
+    )
+    all_anomalies = error_report.anomalies + param_report.anomalies
+    if not all_anomalies:
+        print("  → ✓ No anomalies detected.")
+    else:
+        for a in all_anomalies:
+            print(f"  → [{a.severity.upper()}] {a.location}: {a.what_changed}")
+
+    # ── Module 08: OptiLoop ───────────────────────────────────────────────
+    print("\n[M08] OptiLoop — comparing target vs expected vs simulated…")
+    opt = OptiLoop().optimize(design, analysis, target_spec, expected=char)
+    print(f"  → Verdict: {opt.verdict.value}  (score: {opt.score:.2f})")
+    print(f"  → {opt.summary}")
+    for mod in opt.modifications[:3]:
+        print(f"     • {mod.parameter}: {mod.current_value} → {mod.suggested_value} {mod.unit}")
+
+    # ── Assemble session ──────────────────────────────────────────────────
+    session = new_session()
+    session.requirements = requirements
+    session.design = design
+    session.characteristics = char
+    session.analysis = analysis
+    session.error_report = error_report
+    session.optimization = opt
+
+    # ── Module 09: Engineer-in-the-Loop ───────────────────────────────────
+    print("\n[M09] Engineer-in-the-Loop — generating briefing…\n")
+    eitl = EngineerInTheLoop()
+    if print_briefing:
+        print(eitl.generate_briefing(session))
+
+    # Record the decision (in non-interactive mode, use the auto_decision arg)
+    decision = EngineerDecision(auto_decision.upper())
+    session = eitl.record_decision(
+        session,
+        decision=decision,
+        notes=f"[Auto] Decision set to {decision.value} for pipeline run.",
+    )
+    print(f"\n→ Engineer decision recorded: {session.engineer_decision.value}")
+
+    return session.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="SemiGen AI Prototype Pipeline")
+    parser.add_argument(
+        "--desc",
+        default="I need a low-power NMOS with high drive current and low leakage.",
+        help="Natural language device description",
+    )
+    parser.add_argument("--max-ioff", type=float, default=1e-10,
+                        help="Max Ioff target (A/µm)")
+    parser.add_argument("--min-ion", type=float, default=1e-5,
+                        help="Min Ion target (A/µm)")
+    parser.add_argument("--max-ss", type=float, default=90.0,
+                        help="Max subthreshold slope (mV/dec)")
+    parser.add_argument("--decision", default="MODIFY",
+                        choices=["ACCEPT", "MODIFY", "REJECT"],
+                        help="Simulated engineer decision (non-interactive)")
+    parser.add_argument("--json", action="store_true",
+                        help="Output final session as JSON")
+    args = parser.parse_args()
+
+    spec = TargetSpec(
+        max_ioff_A_um=args.max_ioff,
+        min_ion_A_um=args.min_ion,
+        max_ss_mV_dec=args.max_ss,
+    )
+
+    print("=" * 70)
+    print("  SEMIGEN AI — Functional Prototype")
+    print("  An AI-Powered Semiconductor Design Assistant")
+    print("=" * 70)
+
+    result = run_pipeline(
+        description=args.desc,
+        target_spec=spec,
+        auto_decision=args.decision,
+        print_briefing=True,
+    )
+
+    if args.json:
+        print("\n--- Session Summary (JSON) ---")
+        print(json.dumps(result, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()
+
+
+"""
+SemiGen AI — Top-level package init.
+"""
+
+from .modules import (
+    Intent2Device, DeviceRequirements,
+    DeviceArchitect, DeviceDesign,
+    SmartSample, DeviceCharacteristics, SamplePoint,
+    SiliconSense, PhysicsInsight,
+    SimuVision, SimulationAnalysis,
+    ErrorRadar, ErrorReport, Anomaly,
+    OptiLoop, OptimizationResult, TargetSpec, Verdict,
+    EngineerInTheLoop, EngineerDecision, DesignSession, new_session,
+)
+
+__version__ = "0.1.0-prototype"
+__all__ = [
+    "Intent2Device", "DeviceRequirements",
+    "DeviceArchitect", "DeviceDesign",
+    "SmartSample", "DeviceCharacteristics", "SamplePoint",
+    "SiliconSense", "PhysicsInsight",
+    "SimuVision", "SimulationAnalysis",
+    "ErrorRadar", "ErrorReport", "Anomaly",
+    "OptiLoop", "OptimizationResult", "TargetSpec", "Verdict",
+    "EngineerInTheLoop", "EngineerDecision", "DesignSession", "new_session",
+]
