@@ -26,7 +26,7 @@ Next, SmartSample will establish the relationship between device parameters and 
 
 Through SiliconSense, the system will incorporate semiconductor-physics relationships into its reasoning. It will analyze how variations in physical parameters influence device-level parameters and ultimately affect electrical performance. This will make the AI’s predictions more interpretable from an engineering perspective.
 
-Simulation results will then be processed by SimuVision, which will automatically extract and interpret important characteristics such as I\!-\!V behavior, V_{TH}, I_{ON}/I_{OFF}, leakage, power, delay, and breakdown behavior.
+Simulation results will then be processed by SimuVision, which will automatically extract and interpret important characteristics such as I-V behavior, V_{TH}, I_{ON}/I_{OFF}, leakage, power, delay, and breakdown behavior.
 
 The ErrorRadar module will compare observed simulation behavior against expected trends and engineering constraints to identify anomalies, unexpected characteristics, parameter inconsistencies, and deviations from the intended behavior.
 
