@@ -38,7 +38,7 @@ Architecture:
 
 The current architecture will therefore follow an intelligent closed-loop pipeline:
 
-# Natural Language → Engineering Requirements → Device Design → Data-Driven Prediction → Physics-Based Interpretation → Simulation Analysis → Error Detection → Optimization → Human Validation
+Natural Language → Engineering Requirements → Device Design → Data-Driven Prediction → Physics-Based Interpretation → Simulation Analysis → Error Detection → Optimization → Human Validation
 
 This architecture will allow SemiGenAI to function as an AI-powered semiconductor design assistant rather than simply a prediction model. Each module will contribute a specific layer of intelligence, creating a workflow where AI will progressively understand the design objective, learn device behavior, interpret simulation results, identify problems, and recommend the next engineering action.
 
